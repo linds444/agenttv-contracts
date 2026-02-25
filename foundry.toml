@@ -1,0 +1,20 @@
+[profile.default]
+src = "src"
+out = "out"
+libs = ["lib"]
+solc = "0.8.26"
+via_ir = true
+optimizer = true
+optimizer_runs = 200
+remappings = [
+    "@flaunch/=lib/flaunchgg-contracts/src/contracts/",
+    "@flaunch-interfaces/=lib/flaunchgg-contracts/src/interfaces/",
+    "@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/",
+    "@openzeppelin/contracts-upgradeable/=lib/flaunchgg-contracts/lib/openzeppelin-contracts-upgradeable/contracts/",
+    "@solady/=lib/solady/src/",
+    "@uniswap/v4-core/=lib/flaunchgg-contracts/lib/v4-core/",
+    "@uniswap-periphery/=lib/flaunchgg-contracts/lib/v4-periphery/src/",
+    "@optimism/=lib/flaunchgg-contracts/lib/optimism/packages/contracts-bedrock/",
+    "openzeppelin-contracts/=lib/openzeppelin-contracts/",
+    "openzeppelin-contracts-upgradeable/=lib/flaunchgg-contracts/lib/openzeppelin-contracts-upgradeable/"
+]

@@ -1,0 +1,19 @@
+# secrets — never commit
+.env
+.env.*
+*.pem
+*.key
+id_rsa
+credentials.json
+secrets.json
+
+# foundry build artifacts
+out/
+cache/
+broadcast/*/run-latest.json
+
+# node
+node_modules/
+
+# OS
+.DS_Store
