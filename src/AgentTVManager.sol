@@ -4,15 +4,17 @@ pragma solidity ^0.8.26;
 /**
  * @title AgentTVManager
  * @author Alfred & Linds
- * @notice A novel Flaunch TreasuryManager combining four fee mechanics:
+ * @notice A novel Flaunch TreasuryManager combining five fee mechanics:
  *
  *   📈 VOLUME SEATS   (40%) — Hold the token, snapshot your balance weekly, earn proportionally.
  *                             Diamond Vault holders get a multiplier on their snapshot weight.
  *   💎 DIAMOND VAULTS (10%) — Lock tokens 30/60/90 days → 1.5x/1.75x/2x multiplier on seat weight.
- *   🎯 CONVICTION POOL(25%) — 50 slots, one-time USDC buy-in (bonding curve), earn forever.
- *                             Slots are transferable — secondary market built-in.
+ *   🎯 CONVICTION POOL(25%) — 50 competitive slots. Enter for $1 USDC, keep depositing to hold
+ *                             your lead. First to deposit $50 in a slot locks it permanently.
+ *                             Below $40 = anyone can outbid you. At $50 = yours forever.
  *   🔄 WEEKLY AUCTION  (5%) — Each epoch's pot goes to the highest ETH bidder. Bid wars = fun.
  *   👑 OWNER          (20%) — Immediate allocation, claimable anytime.
+ *   💼 PLATFORM        (1%) — Off the top of all trades and deposits → platform owner wallet.
  *
  * @dev Extends TreasuryManager from flayerlabs/flaunchgg-contracts.
  *      Requires: @flaunch, @flaunch-interfaces, @openzeppelin, @solady
@@ -35,6 +37,10 @@ contract AgentTVManager is TreasuryManager, ReentrancyGuard {
     uint256 public constant EPOCH_DURATION    = 7 days;
     uint256 public constant AUCTION_WINDOW    = 24 hours;
 
+    /// Platform fee — 1% of all incoming ETH fees and USDC deposits → platformOwner
+    uint256 public constant PLATFORM_BPS      = 100;   // 1% (basis points, /10_000)
+    uint256 public constant BPS_DENOM         = 10_000;
+
     /// Fee shares (5 decimal precision — 100_00000 = 100%)
     uint256 public constant TOTAL_SHARES      = 100_00000;
     uint256 public constant OWNER_SHARE       = 20_00000;  // 20%
@@ -43,10 +49,11 @@ contract AgentTVManager is TreasuryManager, ReentrancyGuard {
     uint256 public constant CONVICTION_SHARE  = 25_00000;  // 25%
     uint256 public constant AUCTION_SHARE     =  5_00000;  //  5%
 
-    /// Conviction pool
-    uint256 public constant MAX_CONVICTION_SLOTS  = 50;
-    uint256 public constant CONVICTION_BASE_PRICE = 1e6;   // $1 USDC base
-    uint256 public constant CONVICTION_STEP       = 1e6;   // +$1 per slot sold
+    /// Conviction pool — competitive deposit model
+    uint256 public constant MAX_CONVICTION_SLOTS = 50;
+    uint256 public constant SLOT_MIN_DEPOSIT     = 1e6;   // $1 USDC minimum entry
+    uint256 public constant SLOT_LOCK_PRICE      = 50e6;  // $50 USDC → permanent lock
+    uint256 public constant SLOT_SAFE_THRESHOLD  = 40e6;  // below $40 = can be outbid
 
     /// Diamond vault multipliers (basis points: 10_000 = 1x)
     uint256 public constant VAULT_30D_BP = 15_000;  // 1.5x
@@ -66,11 +73,12 @@ contract AgentTVManager is TreasuryManager, ReentrancyGuard {
     error AuctionStillActive();
     error AuctionWindowClosed();
     error BidTooLow();
-    error ConvictionSlotsFull();
+    error DepositTooSmall();
     error EpochNotOver();
     error InvalidLockDuration();
     error NoVaultFound();
-    error NotSlotOwner();
+    error SlotAlreadyLocked();
+    error SlotIdInvalid();
     error TokenNotDeposited();
     error UnableToSendETH(bytes reason);
     error VaultStillLocked();
@@ -85,49 +93,50 @@ contract AgentTVManager is TreasuryManager, ReentrancyGuard {
     event HolderFeesClaimed(address indexed user, uint256 indexed epochId, uint256 amount);
     event VaultLocked(address indexed user, uint256 amount, uint256 unlockTime, uint256 multiplierBP);
     event VaultUnlocked(address indexed user, uint256 amount);
-    event ConvictionSlotBought(address indexed buyer, uint256 slotId, uint256 priceUsdc);
-    event ConvictionSlotTransferred(uint256 indexed slotId, address indexed from, address indexed to);
+    event SlotDeposited(address indexed user, uint256 indexed slotId, uint256 amount, uint256 userTotal);
+    event SlotLeaderChanged(uint256 indexed slotId, address indexed newLeader, uint256 amount);
+    event SlotLocked(address indexed owner, uint256 indexed slotId);
     event ConvictionFeesClaimed(address indexed user, uint256 amount);
     event AuctionBid(address indexed bidder, uint256 indexed epochId, uint256 amount);
     event AuctionSettled(address indexed winner, uint256 indexed epochId, uint256 pot);
     event OwnerFeesClaimed(uint256 amount);
+    event PlatformFeePaid(address indexed to, uint256 ethAmount);
 
     // ─────────────────────────────────────────────────
     //  STRUCTS
     // ─────────────────────────────────────────────────
 
     struct Epoch {
-        uint256 holderFees;           // ETH for holder pool
-        uint256 vaultFees;            // ETH for vault boosters
-        uint256 auctionPot;           // ETH for weekly auction
-        uint256 totalWeight;          // sum of all snapshotted weights
-        uint256 auctionEnd;           // timestamp when bidding closes
+        uint256 holderFees;
+        uint256 vaultFees;
+        uint256 auctionPot;
+        uint256 totalWeight;
+        uint256 auctionEnd;
         address highestBidder;
         uint256 highestBid;
         bool    settled;
     }
 
     struct UserEpochData {
-        uint256 weight;          // snapshotted weight (balance + vault boost)
-        uint256 claimedHolder;   // ETH already claimed from holderFees
-        uint256 claimedVault;    // ETH already claimed from vaultFees
+        uint256 weight;
+        uint256 claimedHolder;
+        uint256 claimedVault;
     }
 
     struct VaultEntry {
-        uint256 amount;          // tokens locked
-        uint256 unlockTime;      // when lockup expires
-        uint256 multiplierBP;    // 15000 / 17500 / 20000
+        uint256 amount;
+        uint256 unlockTime;
+        uint256 multiplierBP;
     }
 
     // ─────────────────────────────────────────────────
     //  STATE
     // ─────────────────────────────────────────────────
 
-    /// Memecoin address (set on first deposit)
     address public memecoin;
-
-    /// USDC address (for conviction pool purchases)
     address public immutable usdc;
+    /// @dev Hardcoded platform wallet — receives 1% of all trades & deposits, immutable forever
+    address public constant platformOwner = 0x6946Ee4dE034c554EFAb9Ca19CBA358368Aa7Eb7;
 
     // — Epoch tracking —
     uint256 public currentEpoch;
@@ -139,11 +148,17 @@ contract AgentTVManager is TreasuryManager, ReentrancyGuard {
     uint256 public ownerFeesAccrued;
     uint256 public ownerFeesClaimed;
 
-    // — Conviction pool —
-    mapping(uint256 => address) public convictionSlotOwner;  // slotId → owner
-    uint256 public slotsSold;
-    uint256 public totalConvictionEth;                        // lifetime ETH allocated
-    mapping(address => uint256) public convictionClaimed;     // ETH already claimed per address
+    // — Conviction pool (competitive deposit model) —
+    // Each slot: multiple depositors compete. First to $50 locks permanently.
+    // Below $40 = anyone can outbid. At $50 = yours forever.
+    mapping(uint256 => mapping(address => uint256)) public slotDeposits;   // slotId → depositor → amount
+    mapping(uint256 => address)                      public slotLeader;     // slotId → current leader
+    mapping(uint256 => uint256)                      public slotLeaderAmt;  // slotId → leader's total
+    mapping(uint256 => bool)                         public slotLocked;     // slotId → permanently locked
+    mapping(uint256 => address)                      public slotLockedBy;   // slotId → permanent owner
+    mapping(uint256 => uint256)                      public slotTotalDeposits; // slotId → sum of all deposits
+    uint256 public totalConvictionEth;                                      // lifetime ETH allocated
+    mapping(address => uint256) public convictionClaimed;                   // ETH already claimed per address
 
     // — Diamond vaults —
     mapping(address => VaultEntry) public vaults;
@@ -161,7 +176,7 @@ contract AgentTVManager is TreasuryManager, ReentrancyGuard {
     }
 
     // ─────────────────────────────────────────────────
-    //  INITIALIZATION  (called once by TreasuryManagerFactory)
+    //  INITIALIZATION
     // ─────────────────────────────────────────────────
 
     function _initialize(address /*_owner*/, bytes calldata /*_data*/) internal override {
@@ -178,25 +193,32 @@ contract AgentTVManager is TreasuryManager, ReentrancyGuard {
         address /*_creator*/,
         bytes calldata /*_data*/
     ) internal override {
-        // Resolve and store the memecoin address for balance lookups
         memecoin = address(_flaunchToken.flaunch.memecoin(_flaunchToken.tokenId));
     }
 
     // ─────────────────────────────────────────────────
-    //  FEE RECEIPT  (ETH flows in here from FeeEscrow)
+    //  FEE RECEIPT
     // ─────────────────────────────────────────────────
 
     receive() external override payable {
         if (msg.value == 0) return;
 
-        uint256 ownerCut   = (msg.value * OWNER_SHARE)       / TOTAL_SHARES;
-        uint256 holderCut  = (msg.value * HOLDER_SHARE)      / TOTAL_SHARES;
-        uint256 vaultCut   = (msg.value * VAULT_BOOST_SHARE) / TOTAL_SHARES;
-        uint256 convCut    = (msg.value * CONVICTION_SHARE)  / TOTAL_SHARES;
-        // Remainder (avoids rounding loss)
-        uint256 auctCut    = msg.value - ownerCut - holderCut - vaultCut - convCut;
+        // 1% platform fee off the top → platformOwner wallet
+        uint256 platformCut = (msg.value * PLATFORM_BPS) / BPS_DENOM;
+        uint256 remainder   = msg.value - platformCut;
+        if (platformCut > 0) {
+            _sendETH(platformOwner, platformCut);
+            emit PlatformFeePaid(platformOwner, platformCut);
+        }
 
-        ownerFeesAccrued  += ownerCut;
+        // Split remaining 99% among the 5 mechanics
+        uint256 ownerCut   = (remainder * OWNER_SHARE)       / TOTAL_SHARES;
+        uint256 holderCut  = (remainder * HOLDER_SHARE)      / TOTAL_SHARES;
+        uint256 vaultCut   = (remainder * VAULT_BOOST_SHARE) / TOTAL_SHARES;
+        uint256 convCut    = (remainder * CONVICTION_SHARE)  / TOTAL_SHARES;
+        uint256 auctCut    = remainder - ownerCut - holderCut - vaultCut - convCut;
+
+        ownerFeesAccrued   += ownerCut;
         totalConvictionEth += convCut;
 
         Epoch storage ep = epochs[currentEpoch];
@@ -209,34 +231,23 @@ contract AgentTVManager is TreasuryManager, ReentrancyGuard {
     //  EPOCH MANAGEMENT
     // ─────────────────────────────────────────────────
 
-    /**
-     * @notice Advance to the next epoch. Callable by anyone after EPOCH_DURATION.
-     *         Opens a 24hr auction window for the current epoch's pot.
-     */
     function advanceEpoch() external {
         if (block.timestamp < epochStart + EPOCH_DURATION) revert EpochNotOver();
 
-        // Open auction window for the epoch that just ended
         Epoch storage ep = epochs[currentEpoch];
         if (ep.auctionPot > 0 && ep.auctionEnd == 0) {
             ep.auctionEnd = block.timestamp + AUCTION_WINDOW;
         }
 
         emit EpochAdvanced(currentEpoch, ep.holderFees, ep.vaultFees, ep.auctionPot);
-
         unchecked { currentEpoch++; }
         epochStart = block.timestamp;
     }
 
     // ─────────────────────────────────────────────────
-    //  📈 VOLUME SEATS — snapshot + claim
+    //  📈 VOLUME SEATS
     // ─────────────────────────────────────────────────
 
-    /**
-     * @notice Record your token balance for the current epoch.
-     *         Call anytime during the epoch. Weight = balance + vault boost.
-     *         Can be called multiple times — only updates if weight increases.
-     */
     function snapshotBalance() external {
         if (memecoin == address(0)) revert TokenNotDeposited();
 
@@ -244,7 +255,7 @@ contract AgentTVManager is TreasuryManager, ReentrancyGuard {
         uint256 weight     = _computeWeight(msg.sender, rawBalance);
 
         UserEpochData storage ud = userEpochs[msg.sender][currentEpoch];
-        if (weight <= ud.weight) return; // only grow, never shrink
+        if (weight <= ud.weight) return;
 
         Epoch storage ep = epochs[currentEpoch];
         ep.totalWeight = ep.totalWeight - ud.weight + weight;
@@ -253,22 +264,17 @@ contract AgentTVManager is TreasuryManager, ReentrancyGuard {
         emit BalanceSnapshotted(msg.sender, currentEpoch, weight);
     }
 
-    /**
-     * @notice Claim holder-pool + vault-boost fees for a completed epoch.
-     * @param _epochId Must be a past epoch (< currentEpoch)
-     */
     function claimHolderFees(uint256 _epochId) external nonReentrant returns (uint256 amount_) {
         if (_epochId >= currentEpoch) revert EpochNotOver();
 
-        UserEpochData storage ud  = userEpochs[msg.sender][_epochId];
-        Epoch         storage ep  = epochs[_epochId];
+        UserEpochData storage ud = userEpochs[msg.sender][_epochId];
+        Epoch         storage ep = epochs[_epochId];
 
         if (ud.weight == 0 || ep.totalWeight == 0) return 0;
 
         uint256 holderAlloc = (ep.holderFees * ud.weight) / ep.totalWeight;
         uint256 vaultAlloc  = (ep.vaultFees  * ud.weight) / ep.totalWeight;
-
-        uint256 unclaimed = (holderAlloc - ud.claimedHolder) + (vaultAlloc - ud.claimedVault);
+        uint256 unclaimed   = (holderAlloc - ud.claimedHolder) + (vaultAlloc - ud.claimedVault);
         if (unclaimed == 0) return 0;
 
         ud.claimedHolder = holderAlloc;
@@ -280,15 +286,9 @@ contract AgentTVManager is TreasuryManager, ReentrancyGuard {
     }
 
     // ─────────────────────────────────────────────────
-    //  💎 DIAMOND VAULTS — lock tokens for multiplier
+    //  💎 DIAMOND VAULTS
     // ─────────────────────────────────────────────────
 
-    /**
-     * @notice Lock memecoin tokens to earn a multiplier on your holder seat weight.
-     *         Stacks with existing vault (takes best multiplier, longest unlock time).
-     * @param _amount    Token amount to lock (requires ERC20 approval)
-     * @param _duration  LOCK_30D (1.5x) | LOCK_60D (1.75x) | LOCK_90D (2x)
-     */
     function lockTokens(uint256 _amount, uint256 _duration) external nonReentrant {
         if (_amount == 0) revert ZeroAmount();
         if (_duration != LOCK_30D && _duration != LOCK_60D && _duration != LOCK_90D) {
@@ -301,28 +301,21 @@ contract AgentTVManager is TreasuryManager, ReentrancyGuard {
         else                            multiplierBP = VAULT_90D_BP;
 
         VaultEntry storage v = vaults[msg.sender];
-
-        // If upgrading an existing vault, take the better terms
-        if (v.amount > 0) {
-            if (multiplierBP < v.multiplierBP) multiplierBP = v.multiplierBP;
-        }
+        if (v.amount > 0 && multiplierBP < v.multiplierBP) multiplierBP = v.multiplierBP;
 
         IERC20(memecoin).safeTransferFrom(msg.sender, address(this), _amount);
 
-        v.amount       += _amount;
-        v.unlockTime    = block.timestamp + _duration;
-        v.multiplierBP  = multiplierBP;
+        v.amount      += _amount;
+        v.unlockTime   = block.timestamp + _duration;
+        v.multiplierBP = multiplierBP;
 
         emit VaultLocked(msg.sender, v.amount, v.unlockTime, v.multiplierBP);
     }
 
-    /**
-     * @notice Withdraw tokens from a vault after the lock period expires.
-     */
     function unlockTokens() external nonReentrant {
         VaultEntry storage v = vaults[msg.sender];
-        if (v.amount == 0)                      revert NoVaultFound();
-        if (block.timestamp < v.unlockTime)     revert VaultStillLocked();
+        if (v.amount == 0)                  revert NoVaultFound();
+        if (block.timestamp < v.unlockTime) revert VaultStillLocked();
 
         uint256 amount = v.amount;
         delete vaults[msg.sender];
@@ -332,41 +325,63 @@ contract AgentTVManager is TreasuryManager, ReentrancyGuard {
     }
 
     // ─────────────────────────────────────────────────
-    //  🎯 CONVICTION POOL — buy a permanent fee share
+    //  🎯 CONVICTION POOL — competitive deposit model
     // ─────────────────────────────────────────────────
 
     /**
-     * @notice Buy the next available conviction slot.
-     *         Price = $1 + ($1 × slotsSold). Slot 0 = $1, Slot 49 = $50.
-     *         Requires USDC approval. USDC goes directly to managerOwner.
-     * @return slotId_ The ID of the slot purchased (0–49)
+     * @notice Deposit USDC into a conviction slot to compete for it.
+     *
+     *   Rules:
+     *   - Any slot accepts $1 USDC minimum.
+     *   - Your deposit accumulates. First to reach $50 total in a slot locks it permanently.
+     *   - Once locked, no one else can deposit into that slot.
+     *   - Below $40 personal total: anyone can deposit more than you and take the lead.
+     *   - Fee share: locked slot owner gets full slot share.
+     *                Unlocked slots split fees proportional to each depositor's total.
+     *
+     * @param _slotId  Which slot to deposit into (0–49)
+     * @param _amount  USDC amount (6 decimals, minimum 1e6)
      */
-    function buyConvictionSlot() external nonReentrant returns (uint256 slotId_) {
-        if (slotsSold >= MAX_CONVICTION_SLOTS) revert ConvictionSlotsFull();
+    function depositIntoSlot(uint256 _slotId, uint256 _amount) external nonReentrant {
+        if (_slotId >= MAX_CONVICTION_SLOTS) revert SlotIdInvalid();
+        if (slotLocked[_slotId])             revert SlotAlreadyLocked();
+        if (_amount < SLOT_MIN_DEPOSIT)      revert DepositTooSmall();
 
-        slotId_ = slotsSold;
-        uint256 price = CONVICTION_BASE_PRICE + (slotId_ * CONVICTION_STEP);
+        // 1% platform fee on USDC deposit → platformOwner
+        uint256 platformCut = (_amount * PLATFORM_BPS) / BPS_DENOM;
+        uint256 ownerCut    = _amount - platformCut;
 
-        IERC20(usdc).safeTransferFrom(msg.sender, managerOwner, price);
+        IERC20(usdc).safeTransferFrom(msg.sender, platformOwner, platformCut);
+        IERC20(usdc).safeTransferFrom(msg.sender, managerOwner,  ownerCut);
 
-        convictionSlotOwner[slotId_] = msg.sender;
-        unchecked { slotsSold++; }
+        slotDeposits[_slotId][msg.sender]   += _amount;
+        slotTotalDeposits[_slotId]          += _amount;
 
-        emit ConvictionSlotBought(msg.sender, slotId_, price);
+        uint256 myTotal = slotDeposits[_slotId][msg.sender];
+
+        // Check for permanent lock
+        if (myTotal >= SLOT_LOCK_PRICE) {
+            slotLocked[_slotId]   = true;
+            slotLockedBy[_slotId] = msg.sender;
+            slotLeader[_slotId]   = msg.sender;
+            slotLeaderAmt[_slotId]= myTotal;
+            emit SlotLocked(msg.sender, _slotId);
+        } else if (myTotal > slotLeaderAmt[_slotId]) {
+            slotLeader[_slotId]    = msg.sender;
+            slotLeaderAmt[_slotId] = myTotal;
+            emit SlotLeaderChanged(_slotId, msg.sender, myTotal);
+        }
+
+        emit SlotDeposited(msg.sender, _slotId, _amount, myTotal);
     }
 
     /**
-     * @notice Transfer a conviction slot to another address (OTC / secondary sale).
-     */
-    function transferConvictionSlot(uint256 _slotId, address _to) external {
-        if (convictionSlotOwner[_slotId] != msg.sender) revert NotSlotOwner();
-        convictionSlotOwner[_slotId] = _to;
-        emit ConvictionSlotTransferred(_slotId, msg.sender, _to);
-    }
-
-    /**
-     * @notice Claim accumulated ETH from conviction pool.
-     *         Earnings = (slots you own / total slots sold) × totalConvictionEth
+     * @notice Claim accumulated ETH from the conviction pool.
+     *
+     *   Earnings per user:
+     *   - For each locked slot they own → (1 / MAX_CONVICTION_SLOTS) × totalConvictionEth
+     *   - For each unlocked slot they've deposited into →
+     *       (their deposit / slot total deposits) × (1 / MAX_CONVICTION_SLOTS) × totalConvictionEth
      */
     function claimConvictionFees() external nonReentrant returns (uint256 amount_) {
         _withdrawAllFees(address(this), true);
@@ -379,24 +394,17 @@ contract AgentTVManager is TreasuryManager, ReentrancyGuard {
     }
 
     // ─────────────────────────────────────────────────
-    //  🔄 WEEKLY AUCTION — bid on the epoch pot
+    //  🔄 WEEKLY AUCTION
     // ─────────────────────────────────────────────────
 
-    /**
-     * @notice Bid ETH on an epoch's auction pot.
-     *         Bidding opens after that epoch's advanceEpoch() call.
-     *         Previous bidder is automatically refunded.
-     * @param _epochId The epoch to bid on
-     */
     function bid(uint256 _epochId) external payable nonReentrant {
         if (msg.value == 0) revert ZeroAmount();
 
         Epoch storage ep = epochs[_epochId];
-        if (ep.auctionEnd == 0)                     revert AuctionNotStarted();
-        if (block.timestamp > ep.auctionEnd)         revert AuctionWindowClosed();
-        if (msg.value <= ep.highestBid)              revert BidTooLow();
+        if (ep.auctionEnd == 0)              revert AuctionNotStarted();
+        if (block.timestamp > ep.auctionEnd) revert AuctionWindowClosed();
+        if (msg.value <= ep.highestBid)      revert BidTooLow();
 
-        // Refund the previous bidder
         if (ep.highestBidder != address(0)) {
             _sendETH(ep.highestBidder, ep.highestBid);
         }
@@ -407,16 +415,11 @@ contract AgentTVManager is TreasuryManager, ReentrancyGuard {
         emit AuctionBid(msg.sender, _epochId, msg.value);
     }
 
-    /**
-     * @notice Settle an auction after the bidding window closes.
-     *         Winner receives the pot. Their bid flows to the owner.
-     *         If no bids, the pot rolls to the owner.
-     */
     function settleAuction(uint256 _epochId) external nonReentrant {
         Epoch storage ep = epochs[_epochId];
-        if (ep.auctionEnd == 0)               revert AuctionNotStarted();
-        if (ep.settled)                        revert AuctionAlreadySettled();
-        if (block.timestamp <= ep.auctionEnd)  revert AuctionStillActive();
+        if (ep.auctionEnd == 0)              revert AuctionNotStarted();
+        if (ep.settled)                       revert AuctionAlreadySettled();
+        if (block.timestamp <= ep.auctionEnd) revert AuctionStillActive();
 
         ep.settled = true;
 
@@ -425,7 +428,6 @@ contract AgentTVManager is TreasuryManager, ReentrancyGuard {
             _sendETH(ep.highestBidder, ep.auctionPot);
             emit AuctionSettled(ep.highestBidder, _epochId, ep.auctionPot);
         } else {
-            // No bids — pot goes to owner
             ownerFeesAccrued += ep.auctionPot;
             emit AuctionSettled(address(0), _epochId, 0);
         }
@@ -435,23 +437,20 @@ contract AgentTVManager is TreasuryManager, ReentrancyGuard {
     //  👑 OWNER FEES
     // ─────────────────────────────────────────────────
 
-    /**
-     * @notice Claim all accumulated owner fees. Only callable by managerOwner.
-     */
     function claimOwnerFees() external nonReentrant onlyManagerOwner returns (uint256 amount_) {
         _withdrawAllFees(address(this), true);
         amount_ = ownerFeesAccrued;
         if (amount_ == 0) return 0;
 
-        ownerFeesClaimed  += amount_;
-        ownerFeesAccrued   = 0;
+        ownerFeesClaimed += amount_;
+        ownerFeesAccrued  = 0;
 
         _sendETH(msg.sender, amount_);
         emit OwnerFeesClaimed(amount_);
     }
 
     // ─────────────────────────────────────────────────
-    //  ITreasuryManager REQUIRED OVERRIDES
+    //  ITreasuryManager OVERRIDES
     // ─────────────────────────────────────────────────
 
     function balances(address _recipient) public view override returns (uint256) {
@@ -464,7 +463,6 @@ contract AgentTVManager is TreasuryManager, ReentrancyGuard {
     function claim() external override nonReentrant returns (uint256 amount_) {
         _withdrawAllFees(address(this), true);
 
-        // Conviction fees
         uint256 convAmt = _pendingConviction(msg.sender);
         if (convAmt > 0) {
             convictionClaimed[msg.sender] += convAmt;
@@ -472,7 +470,6 @@ contract AgentTVManager is TreasuryManager, ReentrancyGuard {
             emit ConvictionFeesClaimed(msg.sender, convAmt);
         }
 
-        // Owner fees
         if (msg.sender == managerOwner && ownerFeesAccrued > 0) {
             amount_          += ownerFeesAccrued;
             ownerFeesClaimed += ownerFeesAccrued;
@@ -487,31 +484,17 @@ contract AgentTVManager is TreasuryManager, ReentrancyGuard {
     //  VIEW HELPERS
     // ─────────────────────────────────────────────────
 
-    /// Next conviction slot price in USDC (6 decimals)
-    function nextSlotPrice() external view returns (uint256) {
-        return CONVICTION_BASE_PRICE + (slotsSold * CONVICTION_STEP);
+    /// State of a slot: 0=empty, 1=open (<$40 leader), 2=contested ($40-49), 3=locked
+    function slotState(uint256 _slotId) external view returns (uint8) {
+        if (slotLocked[_slotId])                          return 3;
+        if (slotLeaderAmt[_slotId] == 0)                  return 0;
+        if (slotLeaderAmt[_slotId] >= SLOT_SAFE_THRESHOLD) return 2;
+        return 1;
     }
 
-    /// How many conviction slots an address owns
-    function convictionSlotsOwned(address _user) external view returns (uint256 count_) {
-        for (uint256 i; i < slotsSold; i++) {
-            if (convictionSlotOwner[i] == _user) count_++;
-        }
-    }
-
-    /// Pending conviction ETH for an address (not yet claimed)
-    function pendingConvictionFees(address _user) external view returns (uint256) {
-        return _pendingConviction(_user);
-    }
-
-    /// Current epoch summary
     function epochInfo() external view returns (
-        uint256 id,
-        uint256 secsRemaining,
-        uint256 holderFees,
-        uint256 vaultFees,
-        uint256 auctionPot,
-        uint256 totalWeight
+        uint256 id, uint256 secsRemaining, uint256 holderFees,
+        uint256 vaultFees, uint256 auctionPot, uint256 totalWeight
     ) {
         id = currentEpoch;
         uint256 ends = epochStart + EPOCH_DURATION;
@@ -520,21 +503,20 @@ contract AgentTVManager is TreasuryManager, ReentrancyGuard {
         return (id, secsRemaining, ep.holderFees, ep.vaultFees, ep.auctionPot, ep.totalWeight);
     }
 
-    /// Vault info for a user
     function vaultInfo(address _user) external view returns (
-        uint256 amount,
-        uint256 unlockTime,
-        uint256 multiplierBP,
-        bool    isLocked
+        uint256 amount, uint256 unlockTime, uint256 multiplierBP, bool isLocked
     ) {
         VaultEntry memory v = vaults[_user];
         return (v.amount, v.unlockTime, v.multiplierBP, block.timestamp < v.unlockTime);
     }
 
-    /// Estimated weight for an address in the current epoch
     function estimatedWeight(address _user) external view returns (uint256) {
         if (memecoin == address(0)) return 0;
         return _computeWeight(_user, IERC20(memecoin).balanceOf(_user));
+    }
+
+    function pendingConvictionFees(address _user) external view returns (uint256) {
+        return _pendingConviction(_user);
     }
 
     // ─────────────────────────────────────────────────
@@ -546,20 +528,42 @@ contract AgentTVManager is TreasuryManager, ReentrancyGuard {
         VaultEntry memory v = vaults[_user];
         if (v.amount > 0 && block.timestamp < v.unlockTime) {
             uint256 locked = v.amount < _balance ? v.amount : _balance;
-            // Replace locked portion with boosted weight
             weight_ = (_balance - locked) + (locked * v.multiplierBP / 10_000);
         }
     }
 
-    function _pendingConviction(address _user) internal view returns (uint256) {
-        if (slotsSold == 0) return 0;
-        uint256 owned;
-        for (uint256 i; i < slotsSold; i++) {
-            if (convictionSlotOwner[i] == _user) owned++;
+    /**
+     * @dev Conviction fee calculation:
+     *   Each slot = (1 / MAX_CONVICTION_SLOTS) of totalConvictionEth.
+     *   Locked slot: 100% of that slot's share goes to lockedBy.
+     *   Unlocked slot: proportional to deposits (userDeposit / slotTotal).
+     */
+    function _pendingConviction(address _user) internal view returns (uint256 earned_) {
+        if (totalConvictionEth == 0) return 0;
+
+        uint256 ethPerSlot = totalConvictionEth / MAX_CONVICTION_SLOTS;
+
+        for (uint256 i; i < MAX_CONVICTION_SLOTS; i++) {
+            if (slotLocked[i]) {
+                // Locked: only the permanent owner earns
+                if (slotLockedBy[i] == _user) {
+                    earned_ += ethPerSlot;
+                }
+            } else {
+                // Unlocked: proportional to deposits
+                uint256 total = slotTotalDeposits[i];
+                if (total > 0) {
+                    uint256 myDeposit = slotDeposits[i][_user];
+                    if (myDeposit > 0) {
+                        earned_ += (ethPerSlot * myDeposit) / total;
+                    }
+                }
+            }
         }
-        if (owned == 0) return 0;
-        uint256 earned = (totalConvictionEth * owned) / slotsSold;
-        return earned > convictionClaimed[_user] ? earned - convictionClaimed[_user] : 0;
+
+        // Subtract already claimed
+        if (earned_ <= convictionClaimed[_user]) return 0;
+        return earned_ - convictionClaimed[_user];
     }
 
     function _sendETH(address _to, uint256 _amount) internal {
