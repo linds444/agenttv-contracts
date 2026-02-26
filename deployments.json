@@ -2,17 +2,30 @@
   "network": "base-mainnet",
   "chainId": 8453,
   "contracts": {
-    "AgentTVManager": {
-      "address": "0x92f2584B354388b9C1c4258862782a4637a33467",
-      "deployedAt": "2026-02-26T19:18:00Z",
-      "txHash": "0x87cb5a5d98e149ac63d7849f6e992ede968e0753a695a09667a8900d5083b449",
+    "AgentTVManager_v3": {
+      "address": "0xC4ba6f8414205E8D6EBdf3e1c4b2989A2fF0d4fe",
+      "deployedAt": "2026-02-26T20:27:00Z",
       "deployer": "0x6946Ee4dE034c554EFAb9Ca19CBA358368Aa7Eb7",
+      "memecoin": "0x15eA7e35B7c5d054E26B982E26a05E77aB4552CD",
+      "flaunchNFT": 4762,
       "constructorArgs": {
         "treasuryManagerFactory": "0x48af8b28DDC5e5A86c4906212fc35Fa808CA8763",
         "feeEscrowRegistry": "0x588aBA851Ac93a188560cfCdB189ac6133457342",
         "usdc": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
       },
-      "notes": "Updated conviction pool to competitive deposit model. Deployable without factory approval per Flaunch team."
+      "notes": "v3 — launched with working image upload via HTTPS metadata URI. Supersedes v2."
+    },
+    "AgentTVManager_v2": {
+      "address": "0x92f2584B354388b9C1c4258862782a4637a33467",
+      "deployedAt": "2026-02-26T19:18:00Z",
+      "txHash": "0x87cb5a5d98e149ac63d7849f6e992ede968e0753a695a09667a8900d5083b449",
+      "deployer": "0x6946Ee4dE034c554EFAb9Ca19CBA358368Aa7Eb7",
+      "status": "deprecated — tokenUri stored as data URI; Flaunch API 500s",
+      "constructorArgs": {
+        "treasuryManagerFactory": "0x48af8b28DDC5e5A86c4906212fc35Fa808CA8763",
+        "feeEscrowRegistry": "0x588aBA851Ac93a188560cfCdB189ac6133457342",
+        "usdc": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+      }
     }
   },
   "relatedContracts": {
