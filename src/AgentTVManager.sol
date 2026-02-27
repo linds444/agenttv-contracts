@@ -75,8 +75,10 @@ contract AgentTVManager is TreasuryManager, ReentrancyGuard {
     error BidTooLow();
     error DepositTooSmall();
     error EpochNotOver();
+    error FlaunchContractNotSupported();
     error InvalidLockDuration();
     error NoVaultFound();
+    error NothingToWithdraw();
     error SlotAlreadyLocked();
     error SlotIdInvalid();
     error TokenNotDeposited();
@@ -99,6 +101,8 @@ contract AgentTVManager is TreasuryManager, ReentrancyGuard {
     event ConvictionFeesClaimed(address indexed user, uint256 amount);
     event AuctionBid(address indexed bidder, uint256 indexed epochId, uint256 amount);
     event AuctionSettled(address indexed winner, uint256 indexed epochId, uint256 pot);
+    event AuctionRefundPending(address indexed bidder, uint256 amount);
+    event AuctionRefundWithdrawn(address indexed bidder, uint256 amount);
     event OwnerFeesClaimed(uint256 amount);
     event PlatformFeePaid(address indexed to, uint256 ethAmount);
 
@@ -138,6 +142,9 @@ contract AgentTVManager is TreasuryManager, ReentrancyGuard {
     /// @dev Hardcoded platform wallet — receives 1% of all trades & deposits, immutable forever
     address public constant platformOwner = 0x6946Ee4dE034c554EFAb9Ca19CBA358368Aa7Eb7;
 
+    /// @dev Flaunch v1.0 contract address — excluded due to broken pool fee allocation
+    address public constant FLAUNCH_V1_0 = 0x6A53F8b799bE11a2A3264eF0bfF183dCB12d9571;
+
     // — Epoch tracking —
     uint256 public currentEpoch;
     uint256 public epochStart;
@@ -162,6 +169,9 @@ contract AgentTVManager is TreasuryManager, ReentrancyGuard {
 
     // — Diamond vaults —
     mapping(address => VaultEntry) public vaults;
+
+    // — Auction refunds (pull payment — avoids DoS via malicious bidder contract) —
+    mapping(address => uint256) public pendingRefunds;
 
     // ─────────────────────────────────────────────────
     //  CONSTRUCTOR
@@ -193,6 +203,8 @@ contract AgentTVManager is TreasuryManager, ReentrancyGuard {
         address /*_creator*/,
         bytes calldata /*_data*/
     ) internal override {
+        // Reject Flaunch v1.0 tokens — pool fee allocation is broken in that version
+        if (address(_flaunchToken.flaunch) == FLAUNCH_V1_0) revert FlaunchContractNotSupported();
         memecoin = address(_flaunchToken.flaunch.memecoin(_flaunchToken.tokenId));
     }
 
@@ -255,7 +267,11 @@ contract AgentTVManager is TreasuryManager, ReentrancyGuard {
         uint256 weight     = _computeWeight(msg.sender, rawBalance);
 
         UserEpochData storage ud = userEpochs[msg.sender][currentEpoch];
-        if (weight <= ud.weight) return;
+
+        // Allow weight to move in both directions. Preventing decreases enables a
+        // double-spend: snapshot at address A, transfer tokens to B, snapshot at B —
+        // both addresses accumulate weight from the same underlying tokens.
+        if (weight == ud.weight) return;
 
         Epoch storage ep = epochs[currentEpoch];
         ep.totalWeight = ep.totalWeight - ud.weight + weight;
@@ -405,14 +421,28 @@ contract AgentTVManager is TreasuryManager, ReentrancyGuard {
         if (block.timestamp > ep.auctionEnd) revert AuctionWindowClosed();
         if (msg.value <= ep.highestBid)      revert BidTooLow();
 
+        // Pull-payment pattern: queue the previous bidder's refund rather than
+        // pushing ETH to them. A malicious bidder contract that reverts on receive
+        // would otherwise permanently DoS the auction (no new bids possible).
         if (ep.highestBidder != address(0)) {
-            _sendETH(ep.highestBidder, ep.highestBid);
+            pendingRefunds[ep.highestBidder] += ep.highestBid;
+            emit AuctionRefundPending(ep.highestBidder, ep.highestBid);
         }
 
         ep.highestBidder = msg.sender;
         ep.highestBid    = msg.value;
 
         emit AuctionBid(msg.sender, _epochId, msg.value);
+    }
+
+    /// @notice Withdraw a queued auction refund. Call this if you were outbid.
+    function withdrawRefund() external nonReentrant {
+        uint256 amount = pendingRefunds[msg.sender];
+        if (amount == 0) revert NothingToWithdraw();
+
+        pendingRefunds[msg.sender] = 0;
+        _sendETH(msg.sender, amount);
+        emit AuctionRefundWithdrawn(msg.sender, amount);
     }
 
     function settleAuction(uint256 _epochId) external nonReentrant {
