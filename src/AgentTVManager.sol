@@ -75,6 +75,7 @@ contract AgentTVManager is TreasuryManager, ReentrancyGuard {
     error BidTooLow();
     error DepositTooSmall();
     error EpochNotOver();
+    error FlaunchContractNotSupported();
     error InvalidLockDuration();
     error NoVaultFound();
     error SlotAlreadyLocked();
@@ -135,8 +136,12 @@ contract AgentTVManager is TreasuryManager, ReentrancyGuard {
 
     address public memecoin;
     address public immutable usdc;
+    
     /// @dev Hardcoded platform wallet — receives 1% of all trades & deposits, immutable forever
     address public constant platformOwner = 0x6946Ee4dE034c554EFAb9Ca19CBA358368Aa7Eb7;
+
+    /// @dev Hardcoded Flaunch v1.0 contract address
+    address public constant FLAUNCH_V1_0 = 0x6A53F8b799bE11a2A3264eF0bfF183dCB12d9571;
 
     // — Epoch tracking —
     uint256 public currentEpoch;
@@ -151,7 +156,7 @@ contract AgentTVManager is TreasuryManager, ReentrancyGuard {
     // — Conviction pool (competitive deposit model) —
     // Each slot: multiple depositors compete. First to $50 locks permanently.
     // Below $40 = anyone can outbid. At $50 = yours forever.
-    mapping(uint256 => mapping(address => uint256)) public slotDeposits;   // slotId → depositor → amount
+    mapping(uint256 => mapping(address => uint256))  public slotDeposits;   // slotId → depositor → amount
     mapping(uint256 => address)                      public slotLeader;     // slotId → current leader
     mapping(uint256 => uint256)                      public slotLeaderAmt;  // slotId → leader's total
     mapping(uint256 => bool)                         public slotLocked;     // slotId → permanently locked
@@ -193,6 +198,11 @@ contract AgentTVManager is TreasuryManager, ReentrancyGuard {
         address /*_creator*/,
         bytes calldata /*_data*/
     ) internal override {
+        // Ensure that the `FlaunchToken` is not from Flaunch 1.0 as this would not provide compatibility with the manager
+        if (address(_flaunchToken.flaunch) == FLAUNCH_V1_0) {
+            revert FlaunchContractNotSupported();
+        }
+        
         memecoin = address(_flaunchToken.flaunch.memecoin(_flaunchToken.tokenId));
     }
 
@@ -248,9 +258,22 @@ contract AgentTVManager is TreasuryManager, ReentrancyGuard {
     //  📈 VOLUME SEATS
     // ─────────────────────────────────────────────────
 
+    /// @custom:audit An attacker can steal a disproportionate share of ETH allocated to holders/vault rewards (up to the majority of
+    /// `HOLDER_SHARE + VAULT_BOOST_SHARE` for an epoch) without maintaining real economic exposure, directly causing loss of funds to
+    /// legitimate claimants.
+    /// Base rewards on time-weighted balances or enforce snapshot timing that cannot be manipulated with transient balances (e.g.,
+    /// take snapshots automatically at epoch end from a trusted oracle/snapshot mechanism, use a TWAB/averaging model, or require
+    /// tokens be held/locked across the epoch to be eligible).
     function snapshotBalance() external {
         if (memecoin == address(0)) revert TokenNotDeposited();
 
+        /// @custom:audit Vault deposits transfer tokens into the contract, but snapshots and weight computation only consider balanceOf(user)
+        /// in the ERC20, so locked tokens do not contribute to (and usually reduce) the user's weight, causing the vault fee pool to be
+        /// distributed to non-vault holders instead of vault participants.
+        /// Include vault-held balances in snapshot weight computation (e.g., snapshot balanceOf(user) + vaults[user].amount and apply the
+        /// multiplier to the vault amount). Alternatively, mint a non-transferable receipt token representing locked position and base
+        /// rewards on that, or keep locked tokens in a separate staking/vault contract whose balances are explicitly included in weight
+        /// snapshots.
         uint256 rawBalance = IERC20(memecoin).balanceOf(msg.sender);
         uint256 weight     = _computeWeight(msg.sender, rawBalance);
 
@@ -569,6 +592,11 @@ contract AgentTVManager is TreasuryManager, ReentrancyGuard {
     function _sendETH(address _to, uint256 _amount) internal {
         if (_amount == 0 || _to == address(0)) return;
         (bool ok, bytes memory reason) = _to.call{value: _amount}("");
+
+        /// @custom:audit If the recipient of the ETH does not implement the `receive` function, or reverts within the function callback, then
+        /// this will revert. This will cause problems for bids as the `highestBidder` can prevent other users from placing bids.
+        /// Any `_sendETH` calls that don't have the `msg.sender` as the `_to` address would be better to use an pull claim escrow pattern
+        /// to prevent bricked calls. Alternatively, you can ignore the `ok` call and not revert if the call fails.
         if (!ok) revert UnableToSendETH(reason);
     }
 }
